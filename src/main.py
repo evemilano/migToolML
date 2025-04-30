@@ -19,6 +19,8 @@ from src.mig_tool import MigTool
 from src.logger import setup_logger, log_error
 from src.matching_algorithms import MatchingAlgorithms
 from src.excel_formatter import highlight_matching_urls, highlight_score_columns
+from src.active_learning import start_active_learning_session
+from src.ml import AIMatchingAlgorithm # Import AI class to access its methods if needed
 
 from config.config import HTTP_CONFIG
 
@@ -125,6 +127,7 @@ def main():
     Inizializza il logger, richiede le configurazioni all'utente e avvia il MigTool.
     Gestisce le eccezioni e registra eventuali errori fatali.
     """
+    logger = None # Initialize logger to None for error handling scope
     try:
         # Initialize logger
         logger = setup_logger()
@@ -153,8 +156,37 @@ def main():
         mig_tool.url_handler.follow_redirects = follow_redirects
         
         # Run the tool and get the path to the generated Excel file
-        excel_path = mig_tool.run()
+        run_results = mig_tool.run()
+
+        if run_results is None:
+            logger.error("MigTool run failed or returned no results. Exiting.")
+            return # Exit main function gracefully
+
+        matches, df_404, df_live, excel_path = run_results
         
+        # --- Start Edit: Active Learning Step ---
+        # We need the AI System instance to add verified matches.
+        # It's part of the MatchingAlgorithms instance within MigTool.
+        ai_system = mig_tool.matching_algorithms.ml_matcher
+
+        if ai_system is not None:
+            # Start the active learning session
+            verified_pairs = start_active_learning_session(matches, df_404, df_live)
+
+            # If the user verified any pairs, add them to the AI history
+            if verified_pairs:
+                logger.info(f"Received {len(verified_pairs)} pairs from active learning session. Adding to history.")
+                try:
+                    ai_system.add_human_verified_matches(verified_pairs)
+                    logger.info("Successfully added human-verified matches to AI history.")
+                except Exception as al_error:
+                    log_error(al_error, logger, "Error adding human-verified matches to AI history.")
+            else:
+                 logger.info("No pairs were verified during the active learning session.")
+        else:
+            logger.warning("AI Matcher instance not found. Skipping active learning.")
+        # --- End Edit ---
+
         ### format excel
         
         # Apply formatting to the generated Excel file
@@ -164,11 +196,14 @@ def main():
             highlight_score_columns(excel_path, logger)  
             logger.info("Formatting complete!")
         else:
-            logger.warning("No Excel file was generated. Skipping Excel formatting.")
+            logger.warning("No Excel file was generated or found. Skipping Excel formatting.")
         
     except Exception as e:
-        log_error(e, logger, "Fatal error in main")
-        raise
+        # Ensure logger exists before trying to use it
+        current_logger = logger if logger else setup_logger(level='ERROR')
+        log_error(e, current_logger, "Fatal error in main execution")
+        # Optional: Re-raise to stop execution or handle differently
+        # raise e
 
 # Questo costrutto verifica se lo script viene eseguito direttamente (non importato come modulo)
 # Quando il file viene eseguito direttamente, __name__ è "__main__"

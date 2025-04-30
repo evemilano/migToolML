@@ -32,7 +32,7 @@ import pandas as pd
 from typing import Optional, Tuple
 from pathlib import Path
 from config.config import ALGORITHM_CONFIG, REQUIRED_COLUMNS
-from src.logger import setup_logger, log_error, log_info
+from src.logger import setup_logger, log_error, log_info, log_warning
 from src.input_handler import InputHandler
 from src.url_handler import URLHandler
 from src.matching_algorithms import MatchingAlgorithms
@@ -185,31 +185,45 @@ class MigTool:
             raise
     
     # run serve a eseguire lo strumento di migrazione URL
-    def run(self):
+    def run(self) -> Optional[Tuple[list[dict], pd.DataFrame, pd.DataFrame, Path]]:
         """
         Run the URL migration tool.
-        
+
         Returns:
-            Optional[Path]: Path to the created Excel file
+            Optional[Tuple[list[dict], pd.DataFrame, pd.DataFrame, Path]]:
+                Tuple containing (matches_list, df_404, df_live, excel_path)
+                Returns None if an error occurs.
         """
         try:
             # Load input data
             df_404, df_live = self.load_input_data()
             if df_404 is None or df_live is None:
-                raise ValueError("Failed to load input data")
-            
+                # Log already happens in load_input_data
+                return None
+
             # Verify 404 URLs
-            df_404 = self.verify_404_urls(df_404)
-            
-            # Find matches
-            matches = self.matching_algorithms.find_matches(df_404, df_live)
-            
-            # Generate output
+            df_404_verified = self.verify_404_urls(df_404.copy()) # Use verified df for matching
+            if df_404_verified.empty:
+                log_warning("No verifiable 404 URLs found after checking status. Cannot proceed with matching.", self.logger)
+                # Decide if we should still return or raise. Returning None might be safer.
+                return None
+
+            # Find matches using the verified 404 URLs
+            matches = self.matching_algorithms.find_matches(df_404_verified, df_live)
+
+            # Generate output using the full original df_404 (or df_404_verified?) depends on desired output
+            # Using matches which inherently links back to the verified URLs seems correct.
             excel_path = self.output_handler.generate_output(matches)
-            
-            # Return the path to the created Excel file
-            return excel_path
-            
+            if excel_path is None:
+                log_error(ValueError("Output generation failed."), self.logger, "Excel output path was None.")
+                return None
+
+            # Return the matches list, original dataframes, and the path to the created Excel file
+            # Return original df_404 & df_live as they might be needed for context outside matching
+            return matches, df_404, df_live, excel_path
+
         except Exception as e:
             log_error(e, self.logger, "Error running URL migration tool")
-            raise 
+            # Optionally re-raise or return None based on desired error handling
+            # raise e
+            return None 

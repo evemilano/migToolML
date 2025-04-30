@@ -89,13 +89,20 @@ class AIMatchingAlgorithm:
             if self.history_file.exists():
                 self.match_history = pd.read_csv(self.history_file)
                 log_info(f"Loaded match history with {len(self.match_history)} records", self.logger)
+                # Ensure 'source' column exists, default to 'auto'
+                if 'source' not in self.match_history.columns:
+                    log_warning("\'source\' column not found in history, defaulting existing records to \'auto\'.", self.logger)
+                    self.match_history['source'] = 'auto'
+                else:
+                    # Fill potential NaN values in source with 'auto'
+                    self.match_history['source'] = self.match_history['source'].fillna('auto')
                 # Clean history if it exceeds maximum size
                 self._clean_history_if_needed()
             else:
                 # Create empty match history DataFrame
                 self.match_history = pd.DataFrame(columns=[
                     'timestamp', 'url_404', 'redirect_url', 'agreement_score',
-                    'total_score', 'algorithm', 'is_best_match'
+                    'total_score', 'algorithm', 'is_best_match', 'source'
                 ])
                 log_info("Created new match history", self.logger)
                 
@@ -105,57 +112,141 @@ class AIMatchingAlgorithm:
             # Create new history if loading failed
             self.match_history = pd.DataFrame(columns=[
                 'timestamp', 'url_404', 'redirect_url', 'agreement_score',
-                'total_score', 'algorithm', 'is_best_match'
+                'total_score', 'algorithm', 'is_best_match', 'source'
             ])
     
     def _clean_history_if_needed(self):
         """Clean history using a sophisticated strategy to maintain quality and diversity."""
         if self.match_history is not None and len(self.match_history) > self.max_history_size:
-            # Convert timestamp to datetime if not already
-            self.match_history['timestamp'] = pd.to_datetime(self.match_history['timestamp'])
-            
-            # 1. Mantieni tutti i match ad alta confidenza
-            high_confidence_mask = self.match_history['agreement_score'] >= self.high_confidence_threshold
-            high_confidence_matches = self.match_history[high_confidence_mask].copy()
-            
-            # 2. Per i rimanenti record, implementa una strategia bilanciata
-            other_matches = self.match_history[~high_confidence_mask].copy()
-            
-            # Estrai il codice lingua dall'URL (assumendo formato standard tipo /it/, /en/, /fr/, ecc.)
-            def extract_language(url):
-                import re
-                lang_match = re.search(r'/([a-z]{2})/', url)
-                return lang_match.group(1) if lang_match else 'unknown'
-            
-            other_matches['language'] = other_matches['url_404'].apply(extract_language)
-            
-            # Calcola quanti record mantenere per lingua
-            remaining_slots = self.max_history_size - len(high_confidence_matches)
-            records_per_lang = remaining_slots // other_matches['language'].nunique()
-            
-            # Seleziona i record più recenti per ogni lingua
-            balanced_matches = []
-            for lang in other_matches['language'].unique():
-                lang_matches = other_matches[other_matches['language'] == lang]
-                # Prendi i più recenti per questa lingua
-                recent_lang_matches = lang_matches.nlargest(records_per_lang, 'timestamp')
-                balanced_matches.append(recent_lang_matches)
-            
-            # Combina tutti i record selezionati
-            if balanced_matches:
-                balanced_df = pd.concat(balanced_matches)
-                final_history = pd.concat([high_confidence_matches, balanced_df])
+            log_info(f"History size ({len(self.match_history)}) exceeds limit ({self.max_history_size}). Cleaning...", self.logger)
+            # Ensure source column exists and has no NaNs before cleaning
+            if 'source' not in self.match_history.columns:
+                self.match_history['source'] = 'auto'
             else:
-                final_history = high_confidence_matches
-                
-            # Ordina per timestamp e rimuovi la colonna temporanea 'language'
+                self.match_history['source'] = self.match_history['source'].fillna('auto')
+
+            # Convert timestamp to datetime if not already
+            try:
+                # Use errors='coerce' to handle potential invalid date formats gracefully
+                self.match_history['timestamp'] = pd.to_datetime(self.match_history['timestamp'], errors='coerce')
+                # Drop rows where timestamp conversion failed
+                self.match_history.dropna(subset=['timestamp'], inplace=True)
+            except Exception as e:
+                log_error(e, self.logger, "Error converting timestamp column during cleaning. Some history might be lost.")
+                # Attempt to proceed without timestamp sorting if conversion fails drastically
+                pass
+
+            # 1. Separate human-verified matches
+            human_matches = self.match_history[self.match_history['source'] == 'human'].copy()
+            auto_matches = self.match_history[self.match_history['source'] != 'human'].copy()
+
+            log_info(f"Found {len(human_matches)} human-verified records to keep.", self.logger)
+
+            # 2. Calculate remaining slots for auto matches
+            remaining_slots = self.max_history_size - len(human_matches)
+
+            if remaining_slots <= 0:
+                # If human matches already exceed the limit, keep only human matches
+                # (Optionally, could prune oldest human matches, but let's keep all for now)
+                self.match_history = human_matches.sort_values('timestamp', ascending=False)
+                log_warning(f"Human-verified matches ({len(human_matches)}) exceed max history size ({self.max_history_size}). Keeping only human data.", self.logger)
+                return # Cleaning finished
+
+            if len(auto_matches) <= remaining_slots:
+                 # No need to clean auto_matches further, just combine and return
+                self.match_history = pd.concat([human_matches, auto_matches]).sort_values('timestamp', ascending=False)
+                log_info(f"No cleaning needed for 'auto' records ({len(auto_matches)} <= {remaining_slots} slots).", self.logger)
+                return # Cleaning finished
+
+            # 3. Apply original cleaning logic ONLY to auto_matches to fill remaining_slots
+            log_info(f"Applying cleaning logic to {len(auto_matches)} 'auto' records to fit {remaining_slots} slots.", self.logger)
+
+            # Ensure 'agreement_score' exists and is numeric before filtering
+            if 'agreement_score' not in auto_matches.columns:
+                 log_warning("Cannot perform high-confidence filtering: 'agreement_score' column missing in auto_matches.", self.logger)
+                 high_confidence_auto = pd.DataFrame(columns=auto_matches.columns) # Empty DF
+                 other_auto_matches = auto_matches.copy()
+            else:
+                 # Convert agreement_score to numeric, coercing errors
+                 auto_matches['agreement_score'] = pd.to_numeric(auto_matches['agreement_score'], errors='coerce')
+                 # Separate high confidence auto matches
+                 high_confidence_mask = auto_matches['agreement_score'] >= self.high_confidence_threshold
+                 high_confidence_auto = auto_matches[high_confidence_mask].copy()
+                 other_auto_matches = auto_matches[~high_confidence_mask].copy()
+
+
+            # Check if high confidence auto matches alone fill the remaining slots
+            if len(high_confidence_auto) >= remaining_slots:
+                # Keep only the most recent high-confidence auto matches
+                kept_auto_matches = high_confidence_auto.nlargest(remaining_slots, 'timestamp')
+                log_info(f"Keeping {len(kept_auto_matches)} most recent high-confidence 'auto' records.", self.logger)
+            else:
+                # Keep all high-confidence auto matches and fill the rest with balanced 'other' auto matches
+                slots_for_others = remaining_slots - len(high_confidence_auto)
+
+                if 'url_404' not in other_auto_matches.columns:
+                     log_warning("Cannot perform language balancing: 'url_404' column missing in other_auto_matches.", self.logger)
+                     balanced_other_matches_df = pd.DataFrame(columns=other_auto_matches.columns) # Empty DF
+                elif slots_for_others > 0 and not other_auto_matches.empty:
+                    # Extract language (handle potential errors)
+                    def extract_language(url):
+                        import re
+                        try:
+                            if pd.isna(url): return 'unknown'
+                            lang_match = re.search(r'/([a-z]{2})/', str(url))
+                            return lang_match.group(1) if lang_match else 'unknown'
+                        except Exception:
+                            return 'unknown' # Robustness against non-string URLs etc.
+
+                    other_auto_matches['language'] = other_auto_matches['url_404'].apply(extract_language)
+                    unique_languages = other_auto_matches['language'].nunique()
+
+                    if unique_languages > 0:
+                         records_per_lang = max(1, slots_for_others // unique_languages) # Ensure at least 1 per lang if possible
+                         balanced_other_matches = []
+                         # Select the most recent records per language
+                         for lang, group in other_auto_matches.groupby('language'):
+                             # Ensure timestamp column exists and is sortable before nlargest
+                             if 'timestamp' in group.columns:
+                                 recent_lang_matches = group.nlargest(records_per_lang, 'timestamp')
+                                 balanced_other_matches.append(recent_lang_matches)
+                             else:
+                                 # Fallback if timestamp is missing or problematic
+                                 balanced_other_matches.append(group.head(records_per_lang))
+
+                         if balanced_other_matches:
+                             balanced_other_matches_df = pd.concat(balanced_other_matches).head(slots_for_others) # Ensure we don't exceed slots_for_others
+                         else:
+                             balanced_other_matches_df = pd.DataFrame(columns=other_auto_matches.columns) # Empty DF
+                    else:
+                         # If no unique languages found, just take the most recent overall
+                         balanced_other_matches_df = other_auto_matches.nlargest(slots_for_others, 'timestamp')
+
+                    # Drop the temporary language column
+                    if 'language' in balanced_other_matches_df.columns:
+                        balanced_other_matches_df = balanced_other_matches_df.drop('language', axis=1)
+
+                    log_info(f"Keeping {len(balanced_other_matches_df)} balanced 'other' auto records.", self.logger)
+
+                else: # No slots left for others or no others exist
+                     balanced_other_matches_df = pd.DataFrame(columns=other_auto_matches.columns) # Empty DF
+
+
+                # Combine high-confidence auto and balanced other auto matches
+                kept_auto_matches = pd.concat([high_confidence_auto, balanced_other_matches_df])
+
+
+            # 4. Combine kept human matches and kept auto matches
+            final_history = pd.concat([human_matches, kept_auto_matches])
+
+            # Sort final history by timestamp
             self.match_history = final_history.sort_values('timestamp', ascending=False)
+
+            # Drop temporary language column if it somehow persisted
             if 'language' in self.match_history.columns:
-                self.match_history = self.match_history.drop('language', axis=1)
-                
-            log_info(f"Cleaned match history: {len(high_confidence_matches)} high confidence matches, "
-                    f"{len(self.match_history) - len(high_confidence_matches)} balanced matches", 
-                    self.logger)
+                 self.match_history = self.match_history.drop('language', axis=1)
+
+            log_info(f"Finished cleaning history. Kept {len(human_matches)} human records and {len(kept_auto_matches)} auto records. Total: {len(self.match_history)}.", self.logger)
     
     def _initialize_model(self):
         """Initialize a new model and vectorizers."""
@@ -482,7 +573,8 @@ class AIMatchingAlgorithm:
                                 'agreement_score': agreement_score,
                                 'total_score': total_score,
                                 'algorithm': algo_name,
-                                'is_best_match': (redirect_url == best_redirect)
+                                'is_best_match': (redirect_url == best_redirect),
+                                'source': 'auto'
                             })
                     
                     # Extract features and labels for all redirects
@@ -620,4 +712,106 @@ class AIMatchingAlgorithm:
             "model_features": self.feature_scaler.n_features_in_ if hasattr(self.feature_scaler, 'n_features_in_') else 0
         }
         
-        return stats 
+        return stats
+
+    def add_human_verified_matches(self, verified_pairs: List[Tuple[str, str]]):
+        """
+        Adds human-verified matches to the history, marks them, and saves.
+        Does not retrain the model immediately.
+
+        Args:
+            verified_pairs: A list of (url_404, verified_live_url) tuples.
+        """
+        if not verified_pairs:
+            log_info("No human-verified pairs provided to add.", self.logger)
+            return
+
+        log_info(f"Adding {len(verified_pairs)} human-verified matches to history.", self.logger)
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        human_records = []
+
+        for url_404, verified_live_url in verified_pairs:
+            # Validate URLs before proceeding
+            if not url_404 or not verified_live_url or not isinstance(url_404, str) or not isinstance(verified_live_url, str):
+                 log_warning(f"Skipping invalid human-verified pair: ({url_404}, {verified_live_url})", self.logger)
+                 continue
+
+            # Create a history record for the human-verified pair
+            # Set high agreement/total score placeholders? Or keep NaN/None? Let's use placeholders for now.
+            human_records.append({
+                'timestamp': current_time,
+                'url_404': url_404,
+                'redirect_url': verified_live_url,
+                'agreement_score': 999, # Placeholder for high confidence
+                'total_score': 999,     # Placeholder for high confidence
+                'algorithm': 'human',   # Mark algorithm as human
+                'is_best_match': True,  # Assumed true as it's human verified
+                'source': 'human'       # Mark source as human
+            })
+
+        if not human_records:
+             log_info("No valid human-verified pairs to add after validation.", self.logger)
+             return
+
+        # Create DataFrame from the new human records
+        df_human_history = pd.DataFrame(human_records)
+
+        # Ensure columns match the main history DataFrame before concatenating
+        # This handles cases where the main history might have different columns initially
+        if self.match_history is None:
+             # If history was None, initialize it with the columns from human data
+             self.match_history = pd.DataFrame(columns=df_human_history.columns)
+
+        # Add missing columns to human history df if they exist in main history, fill with default
+        for col in self.match_history.columns:
+             if col not in df_human_history.columns:
+                 # Determine appropriate fill value based on expected type (could be more sophisticated)
+                 fill_value = pd.NA
+                 if col in ['agreement_score', 'total_score']:
+                     fill_value = 0
+                 elif col == 'is_best_match':
+                     fill_value = False
+                 elif col == 'source':
+                      fill_value = 'auto' # Should not happen here, but safe default
+
+                 df_human_history[col] = fill_value
+
+        # Add missing columns to main history df if they exist in human history, fill with default
+        for col in df_human_history.columns:
+              if col not in self.match_history.columns:
+                   fill_value = pd.NA
+                   if col in ['agreement_score', 'total_score']:
+                       fill_value = 0
+                   elif col == 'is_best_match':
+                       fill_value = False
+                   elif col == 'source':
+                        fill_value = 'auto'
+
+                   self.match_history[col] = fill_value
+
+
+        # Ensure column order consistency before concatenation
+        df_human_history = df_human_history[self.match_history.columns]
+
+
+        # Concatenate new human records with existing history
+        if self.match_history is not None and not self.match_history.empty:
+             self.match_history = pd.concat([self.match_history, df_human_history], ignore_index=True)
+        else:
+             self.match_history = df_human_history
+
+
+        # Ensure no duplicate entries based on 404/redirect pair (keep latest if duplicates exist)
+        # Optional: Decide if we want to deduplicate. Let's keep duplicates for now,
+        # as multiple human verifications might be valid over time.
+        # self.match_history.sort_values('timestamp', ascending=False, inplace=True)
+        # self.match_history.drop_duplicates(subset=['url_404', 'redirect_url'], keep='first', inplace=True)
+
+
+        log_info(f"Added {len(df_human_history)} new human records. History size now: {len(self.match_history)}.", self.logger)
+
+        # Clean history again in case adding human records pushed it over the limit
+        self._clean_history_if_needed()
+
+        # Save the updated history (model is not retrained here)
+        self._save_model_and_history() 
