@@ -524,120 +524,231 @@ class AIMatchingAlgorithm:
             
     def update_from_matches(self, matches: List[Dict], df_results: pd.DataFrame):
         """
-        Update AI model from match results.
-        
+        Update AI model from match results, prioritizing human-verified data from history.
+
         Args:
-            matches: List of match dictionaries
-            df_results: DataFrame with processed results including agreement scores
+            matches: List of match dictionaries from the current run.
+            df_results: DataFrame with processed results from the current run, including agreement scores.
         """
-        log_info("Updating AI model from match results", self.logger)
-        
+        log_info("Updating AI model from match results (prioritizing human data)", self.logger)
+
         try:
-            # Extract match information
-            new_records = []
-            training_data = []
-            training_labels = []
+            # --- 1. Prepare Human-Verified Data ---
+            human_training_data = []
+            human_training_labels = []
+            if self.match_history is not None and not self.match_history.empty:
+                human_entries = self.match_history[self.match_history['source'] == 'human']
+                if not human_entries.empty:
+                    log_info(f"Found {len(human_entries)} human-verified records in history for training.", self.logger)
+                    for _, row in human_entries.iterrows():
+                        url_404 = row['url_404']
+                        redirect_url = row['redirect_url']
+                        # Ensure URLs are valid strings before feature extraction
+                        if isinstance(url_404, str) and isinstance(redirect_url, str):
+                            features = self.extract_all_features(url_404, redirect_url)
+                            human_training_data.append(features)
+                            human_training_labels.append(1) # Human verified is always a positive match
+                        else:
+                             log_warning(f"Skipping human record due to invalid URL types: 404='{url_404}', Redirect='{redirect_url}'", self.logger)
+
+            # --- 2. Prepare Auto-Verified Data from Current Run ---
+            auto_training_data = []
+            auto_training_labels = []
+            new_history_records = [] # Keep track of new records to add *after* training prep
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Find best matches from processed results
+
+            processed_404s_for_history = set() # Avoid duplicate history entries from the same run
+
             for idx, row in df_results.iterrows():
                 url_404 = row['404 URL'] if '404 URL' in row else row.get('url_404', None)
                 if url_404 is None:
                     continue
-                    
+
                 best_redirect = row.get('Best redirect', None)
                 if best_redirect is None:
                     continue
-                    
+
                 agreement_score = row.get('Agreement', 0)
                 total_score = row.get('TotScore', 0)
-                
-                # Add to training data if agreement is high enough
+
+                # Find the corresponding match entry from the *current* run's matches
+                match_entry = next((m for m in matches if m.get('url_404') == url_404), None)
+                if not match_entry:
+                    log_warning(f"Could not find original match entry for 404 URL: {url_404} in current run data.", self.logger)
+                    continue
+
+                # Add to training data *only* if agreement is high enough (current run)
                 if agreement_score >= self.agreement_threshold:
-                    # Find all candidate redirects from matches
-                    match_entry = next((m for m in matches if m['url_404'] == url_404), None)
-                    if not match_entry:
-                        continue
-                        
-                    # Get all unique redirect candidates
-                    all_redirects = set()
-                    for algo_name, redirect_url, score in match_entry['matches']:
-                        if redirect_url and redirect_url not in all_redirects:
-                            all_redirects.add(redirect_url)
-                            
-                            # Add to history
-                            new_records.append({
-                                'timestamp': current_time,
-                                'url_404': url_404,
-                                'redirect_url': redirect_url,
-                                'agreement_score': agreement_score,
-                                'total_score': total_score,
-                                'algorithm': algo_name,
-                                'is_best_match': (redirect_url == best_redirect),
-                                'source': 'auto'
-                            })
-                    
-                    # Extract features and labels for all redirects
-                    for redirect_url in all_redirects:
-                        # Extract all features (basic + TF-IDF)
+                    # Get all unique redirect candidates *from this specific match_entry*
+                    current_run_redirects = set()
+                    # Use match_entry['matches'] which should be List[Tuple[str, str, float]]
+                    if 'matches' in match_entry and isinstance(match_entry['matches'], list):
+                        for algo_name, redirect_url, score in match_entry['matches']:
+                            if redirect_url and isinstance(redirect_url, str) and redirect_url not in current_run_redirects:
+                                current_run_redirects.add(redirect_url)
+
+                                # Add to new history records (only once per 404 in this run)
+                                if url_404 not in processed_404s_for_history:
+                                     new_history_records.append({
+                                         'timestamp': current_time,
+                                         'url_404': url_404,
+                                         'redirect_url': redirect_url,
+                                         'agreement_score': agreement_score, # Agreement for the *best* match
+                                         'total_score': total_score,         # Total score for the *best* match
+                                         'algorithm': algo_name,             # Algorithm suggesting *this* redirect
+                                         'is_best_match': (redirect_url == best_redirect), # Is *this* redirect the best?
+                                         'source': 'auto'
+                                     })
+
+
+                    # Extract features and labels for all redirects suggested in *this run*
+                    for redirect_url in current_run_redirects:
+                        # Ensure redirect_url is valid before proceeding
+                        if not isinstance(redirect_url, str):
+                            log_warning(f"Skipping invalid redirect URL type: '{redirect_url}' for 404: '{url_404}'", self.logger)
+                            continue
+
                         features = self.extract_all_features(url_404, redirect_url)
-                        training_data.append(features)
-                        
-                        # Label 1 for best match, 0 for others
+                        auto_training_data.append(features)
+
                         is_best_match = (redirect_url == best_redirect)
-                        training_labels.append(1 if is_best_match else 0)
-                        
-                        # Apply higher weight to high confidence matches
+                        auto_training_labels.append(1 if is_best_match else 0)
+
+                        # Apply higher weight (by duplication) only to high confidence *positive* matches
                         if agreement_score >= self.high_confidence_threshold and is_best_match:
-                            # Add duplicate entries for high confidence matches to increase their weight
-                            for _ in range(2):  # Add two more copies
-                                training_data.append(features)
-                                training_labels.append(1)
-            
-            # Update match history
-            if new_records:
-                new_history = pd.DataFrame(new_records)
+                            for _ in range(2): # Add two more copies for weighting
+                                auto_training_data.append(features)
+                                auto_training_labels.append(1)
+
+                    processed_404s_for_history.add(url_404) # Mark this 404 as processed for history
+
+            # --- 3. Update Match History (after processing current run) ---
+            if new_history_records:
+                new_history = pd.DataFrame(new_history_records)
                 if self.match_history is not None and not self.match_history.empty:
+                    # Ensure columns match before concatenating
+                    for col in new_history.columns:
+                         if col not in self.match_history.columns:
+                              self.match_history[col] = pd.NA # Add missing columns to existing history
+                    for col in self.match_history.columns:
+                         if col not in new_history.columns:
+                              new_history[col] = pd.NA # Add missing columns to new history batch
+                    new_history = new_history[self.match_history.columns] # Ensure order matches
+
                     self.match_history = pd.concat([self.match_history, new_history], ignore_index=True)
                 else:
                     self.match_history = new_history
-                
-                log_info(f"Added {len(new_records)} new records to match history", self.logger)
-                # Clean history if it exceeds maximum size
-                self._clean_history_if_needed()
-            
-            # Train model if we have enough training data
-            if training_data and len(training_data) >= self.min_training_samples:
-                # Convert to numpy arrays
-                X = np.array(training_data)
-                y = np.array(training_labels)
-                
-                log_info(f"Training model with {X.shape[1]} features", self.logger)
-                
-                # Scale features
-                if not hasattr(self.feature_scaler, 'n_features_in_'):
-                    X_scaled = self.feature_scaler.fit_transform(X)
-                else:
-                    X_scaled = self.feature_scaler.transform(X)
-                
-                # Train the model
-                self.model.fit(X_scaled, y)
-                self.model_initialized = True
-                
-                # Log training summary
-                positive_samples = sum(y)
-                log_info(f"Model trained with {len(y)} samples ({positive_samples} positive, {len(y) - positive_samples} negative)", self.logger)
-            elif training_data:
-                log_warning(f"Not enough training samples yet: {len(training_data)}/{self.min_training_samples}", self.logger)
-            else:
-                log_warning("No training data available from current matches", self.logger)
-            
-            # Save updated model and history
+
+                log_info(f"Added {len(new_history_records)} new 'auto' records to match history.", self.logger)
+                self._clean_history_if_needed() # Clean history if needed after adding new records
+
+            # --- 4. Combine Data and Prepare for Training ---
+            combined_training_data = human_training_data + auto_training_data
+            combined_training_labels = human_training_labels + auto_training_labels
+
+            if not combined_training_data:
+                log_warning("No training data available (neither human nor auto) for this update.", self.logger)
+                self._save_model_and_history() # Still save history even if no training
+                return # Exit if no data
+
+            # Minimum samples check applies to the combined data
+            if len(combined_training_data) >= self.min_training_samples:
+                X = np.array(combined_training_data)
+                y = np.array(combined_training_labels)
+
+                log_info(f"Preparing combined training data: {len(human_training_data)} human samples, {len(auto_training_data)} auto samples. Total: {len(X)}")
+
+                # --- 5. Create Sample Weights ---
+                human_weight = 10.0 # Assign higher weight to human data
+                auto_weight = 1.0
+                sample_weights = np.array(
+                    [human_weight] * len(human_training_data) +
+                    [auto_weight] * len(auto_training_data)
+                )
+
+                log_info(f"Using sample weights: {human_weight} for human, {auto_weight} for auto.")
+
+                # --- 6. Scale Features ---
+                try:
+                    if not hasattr(self.feature_scaler, 'n_features_in_') or self.feature_scaler.n_features_in_ != X.shape[1]:
+                        # Check if scaler needs fitting/refitting (e.g., first time or feature dimension changed)
+                         log_info("Fitting feature scaler.", self.logger)
+                         X_scaled = self.feature_scaler.fit_transform(X)
+                    else:
+                         # Check for potential NaN/inf values before transforming
+                         if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+                              log_warning("NaN or Inf found in feature data before scaling. Attempting to handle...", self.logger)
+                              # Simple imputation: replace NaN with 0, Inf with large finite number
+                              X = np.nan_to_num(X, nan=0.0, posinf=1e9, neginf=-1e9)
+
+                         log_info("Transforming features using existing scaler.", self.logger)
+                         X_scaled = self.feature_scaler.transform(X)
+
+                except ValueError as ve:
+                     log_error(ve, self.logger, f"ValueError during feature scaling. X shape: {X.shape}. Scaler features expected: {getattr(self.feature_scaler, 'n_features_in_', 'N/A')}. Skipping training for this run.")
+                     self._save_model_and_history() # Save history
+                     return
+                except Exception as e:
+                    log_error(e, self.logger, "Error during feature scaling. Skipping training for this run.")
+                    self._save_model_and_history() # Save history
+                    return
+
+
+                # --- 7. Train the Model ---
+                log_info(f"Training model with {X_scaled.shape[0]} samples and {X_scaled.shape[1]} features.", self.logger)
+
+                try:
+                     # Ensure model exists
+                     if self.model is None:
+                          log_error(ValueError("Model is None, cannot train."), self.logger, "Attempted to train a non-existent model.")
+                          self._initialize_model() # Try re-initializing
+                          if self.model is None: # If still None, fatal error
+                               raise RuntimeError("Failed to initialize model for training.")
+
+                     # Check class balance in the current batch
+                     unique_labels, counts = np.unique(y, return_counts=True)
+                     label_counts = dict(zip(unique_labels, counts))
+                     log_info(f"Training batch label distribution: {label_counts}")
+                     if len(label_counts) < 2:
+                         log_warning(f"Training batch contains only one class ({label_counts}). Model fitting might be suboptimal or fail.")
+                         # Optional: Add logic here if training requires multiple classes (e.g., skip training)
+                         # For RandomForest, it might still run but won't learn effectively.
+
+                     self.model.fit(X_scaled, y, sample_weight=sample_weights)
+                     self.model_initialized = True # Mark as initialized/trained
+
+                     positive_samples = sum(y)
+                     log_info(f"Model updated successfully using combined data ({positive_samples} positive labels in batch).", self.logger)
+
+                except Exception as e:
+                     log_error(e, self.logger, "Error occurred during model fitting. Model state might be inconsistent.")
+                     # Decide if we should save potentially corrupted model? Maybe not.
+                     # Let's save history only in case of training failure.
+                     self.match_history.to_csv(self.history_file.with_suffix('.err.csv'), index=False) # Save history to error file
+                     log_warning("Saving history to .err.csv due to training failure. Model files not updated.")
+                     return # Don't proceed to saving potentially bad model state
+
+
+            elif combined_training_data: # Data exists but not enough samples
+                log_warning(f"Not enough combined training samples to update model: {len(combined_training_data)}/{self.min_training_samples}", self.logger)
+            else: # Should have been caught earlier, but defensive check
+                 log_warning("No combined training data available.", self.logger)
+
+
+            # --- 8. Save Updated Model and History ---
+            # Save only if training was successful or if no training occurred but history was updated
             self._save_model_and_history()
-            
+
         except Exception as e:
-            log_error(e, self.logger, "Error updating AI model from matches")
-    
+            log_error(e, self.logger, "Unhandled error updating AI model from matches")
+            # Attempt to save history even if there was a major error
+            try:
+                 if self.match_history is not None:
+                      self.match_history.to_csv(self.history_file.with_suffix('.err.csv'), index=False)
+                      log_warning("Saving history to .err.csv due to unhandled error in update_from_matches.")
+            except Exception as save_err:
+                 log_error(save_err, self.logger, "Failed to save history during error handling.")
+
     def find_best_match(self, url_404: str, live_urls: List[str]) -> Tuple[Optional[str], float]:
         """
         Find best match for a 404 URL among live URLs using the AI model.
