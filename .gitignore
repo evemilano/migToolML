@@ -41,7 +41,7 @@ htmlcov/
 .nox/
 
 # Cache di ML/NLP
-data/*.joblib
+#data/*.joblib
 data/*.pkl
 data/*.model
 *.spacy
