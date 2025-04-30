@@ -8,7 +8,8 @@ logger = logging.getLogger(__name__)
 
 def _get_parent_url(url_str: str) -> str | None:
     """
-    Generates the parent URL by removing the last segment of the path.
+    Generates the parent URL by removing the last segment of the path,
+    preserving the trailing slash if appropriate.
 
     Args:
         url_str: The input URL string.
@@ -17,21 +18,39 @@ def _get_parent_url(url_str: str) -> str | None:
         The parent URL string, or None if parsing fails or it's already a root/domain URL.
     """
     try:
-        parsed = urlparse(url_str)
-        path_parts = parsed.path.strip('/').split('/')
-        if len(path_parts) <= 1 and not parsed.query and not parsed.fragment:
-            # Already at domain level or just one path element
+        p = urlparse(url_str)
+        path = p.path
+
+        # Normalize path: remove trailing slash for manipulation, remember if it was there
+        #original_had_slash = path.endswith('/') # We might not need this check explicitly
+        norm_path = path.rstrip('/')
+
+        # If normalized path is empty or just the root, it has no parent directory
+        if not norm_path or norm_path == '/':
             return None
 
-        # Remove the last part of the path
-        parent_path = '/'.join(path_parts[:-1])
-        # Ensure leading slash if path is not empty
-        if parent_path:
-            parent_path = '/' + parent_path
+        # Find the last slash
+        last_slash_index = norm_path.rfind('/')
 
-        # Reconstruct the URL
-        parent_parsed = parsed._replace(path=parent_path, query="", fragment="")
+        # If no slash found, or only the root slash, parent is the root directory
+        if last_slash_index <= 0:
+            parent_path = '/'
+        else:
+            # Parent path is up to the last slash
+            parent_path = norm_path[:last_slash_index]
+            # If the result is empty (e.g., path was /something), parent is root
+            if not parent_path:
+                 parent_path = '/'
+
+        # Add trailing slash to parent path unless it IS the root path
+        if parent_path != '/':
+             parent_path += '/'
+
+        # Reconstruct the URL with the new parent path
+        # Ensure scheme and netloc are preserved
+        parent_parsed = p._replace(path=parent_path, params="", query="", fragment="")
         return urlunparse(parent_parsed)
+
     except Exception as e:
         logger.error(f"Error generating parent URL for {url_str}: {e}")
         return None
