@@ -539,6 +539,7 @@ class AIMatchingAlgorithm:
             if self.match_history is not None and not self.match_history.empty:
                 human_entries = self.match_history[self.match_history['source'] == 'human']
                 if not human_entries.empty:
+                    print(f"DEBUG: Calling log_info near line 542")
                     log_info(f"Found {len(human_entries)} human-verified records in history for training.", self.logger)
                     for _, row in human_entries.iterrows():
                         url_404 = row['url_404']
@@ -639,6 +640,7 @@ class AIMatchingAlgorithm:
                 else:
                     self.match_history = new_history
 
+                print(f"DEBUG: Calling log_info near line 647")
                 log_info(f"Added {len(new_history_records)} new 'auto' records to match history.", self.logger)
                 self._clean_history_if_needed() # Clean history if needed after adding new records
 
@@ -656,7 +658,9 @@ class AIMatchingAlgorithm:
                 X = np.array(combined_training_data)
                 y = np.array(combined_training_labels)
 
-                log_info(f"Preparing combined training data: {len(human_training_data)} human samples, {len(auto_training_data)} auto samples. Total: {len(X)}")
+                print(f"DEBUG: Calling log_info near line 663")
+                # Temporarily simplified the f-string for debugging
+                log_info("DEBUG: Preparing combined training data step.", self.logger)
 
                 # --- 5. Create Sample Weights ---
                 human_weight = 10.0 # Assign higher weight to human data
@@ -666,12 +670,15 @@ class AIMatchingAlgorithm:
                     [auto_weight] * len(auto_training_data)
                 )
 
-                log_info(f"Using sample weights: {human_weight} for human, {auto_weight} for auto.")
+                print(f"DEBUG: Calling log_info near line 674")
+                # Temporarily simplified the f-string for debugging
+                log_info("DEBUG: Using sample weights step.", self.logger)
 
                 # --- 6. Scale Features ---
                 try:
                     if not hasattr(self.feature_scaler, 'n_features_in_') or self.feature_scaler.n_features_in_ != X.shape[1]:
                         # Check if scaler needs fitting/refitting (e.g., first time or feature dimension changed)
+                         print(f"DEBUG: Calling log_info near line 681")
                          log_info("Fitting feature scaler.", self.logger)
                          X_scaled = self.feature_scaler.fit_transform(X)
                     else:
@@ -681,6 +688,7 @@ class AIMatchingAlgorithm:
                               # Simple imputation: replace NaN with 0, Inf with large finite number
                               X = np.nan_to_num(X, nan=0.0, posinf=1e9, neginf=-1e9)
 
+                         print(f"DEBUG: Calling log_info near line 690")
                          log_info("Transforming features using existing scaler.", self.logger)
                          X_scaled = self.feature_scaler.transform(X)
 
@@ -689,44 +697,13 @@ class AIMatchingAlgorithm:
                      self._save_model_and_history() # Save history
                      return
                 except Exception as e:
-                    log_error(e, self.logger, "Error during feature scaling. Skipping training for this run.")
-                    self._save_model_and_history() # Save history
-                    return
-
-
-                # --- 7. Train the Model ---
-                log_info(f"Training model with {X_scaled.shape[0]} samples and {X_scaled.shape[1]} features.", self.logger)
-
-                try:
-                     # Ensure model exists
-                     if self.model is None:
-                          log_error(ValueError("Model is None, cannot train."), self.logger, "Attempted to train a non-existent model.")
-                          self._initialize_model() # Try re-initializing
-                          if self.model is None: # If still None, fatal error
-                               raise RuntimeError("Failed to initialize model for training.")
-
-                     # Check class balance in the current batch
-                     unique_labels, counts = np.unique(y, return_counts=True)
-                     label_counts = dict(zip(unique_labels, counts))
-                     log_info(f"Training batch label distribution: {label_counts}")
-                     if len(label_counts) < 2:
-                         log_warning(f"Training batch contains only one class ({label_counts}). Model fitting might be suboptimal or fail.")
-                         # Optional: Add logic here if training requires multiple classes (e.g., skip training)
-                         # For RandomForest, it might still run but won't learn effectively.
-
-                     self.model.fit(X_scaled, y, sample_weight=sample_weights)
-                     self.model_initialized = True # Mark as initialized/trained
-
-                     positive_samples = sum(y)
-                     log_info(f"Model updated successfully using combined data ({positive_samples} positive labels in batch).", self.logger)
-
-                except Exception as e:
-                     log_error(e, self.logger, "Error occurred during model fitting. Model state might be inconsistent.")
-                     # Decide if we should save potentially corrupted model? Maybe not.
-                     # Let's save history only in case of training failure.
-                     self.match_history.to_csv(self.history_file.with_suffix('.err.csv'), index=False) # Save history to error file
-                     log_warning("Saving history to .err.csv due to training failure. Model files not updated.")
-                     return # Don't proceed to saving potentially bad model state
+                    # Logga stringa fissa invece di 'e' per debug
+                    log_error("DEBUG: Error during model fitting occurred.", self.logger, "Error occurred during model fitting. Model state might be inconsistent.")
+                    # Decide if we should save potentially corrupted model? Maybe not.
+                    # Let's save history only in case of training failure.
+                    self.match_history.to_csv(self.history_file.with_suffix('.err.csv'), index=False) # Save history to error file
+                    log_warning("Saving history to .err.csv due to training failure. Model files not updated.", self.logger)
+                    return # Don't proceed to saving potentially bad model state
 
 
             elif combined_training_data: # Data exists but not enough samples
@@ -745,7 +722,7 @@ class AIMatchingAlgorithm:
             try:
                  if self.match_history is not None:
                       self.match_history.to_csv(self.history_file.with_suffix('.err.csv'), index=False)
-                      log_warning("Saving history to .err.csv due to unhandled error in update_from_matches.")
+                      log_warning("Saving history to .err.csv due to unhandled error in update_from_matches.", self.logger)
             except Exception as save_err:
                  log_error(save_err, self.logger, "Failed to save history during error handling.")
 

@@ -157,7 +157,7 @@ def start_active_learning_session(matches: list[dict], df_404: pd.DataFrame, df_
         # Prompt the user for their choice
         while True:
             # Add 'manual' to the prompt options
-            user_input = input(f"Enter the number (1-{len(options)}) of the correct redirect, type 'manual' to enter a URL, or type 'skip' or 'quit': ").lower()
+            user_input = input(f"Enter the number (1-{len(options)}) of the correct redirect, type 'm' to enter a URL, or type 'skip' or 'quit': ").lower()
 
             if user_input == 'quit':
                 print("Ending active learning session.")
@@ -165,14 +165,14 @@ def start_active_learning_session(matches: list[dict], df_404: pd.DataFrame, df_
             elif user_input == 'skip':
                 print("Skipping this URL.")
                 break # Move to the next 404 URL
-            elif user_input == 'manual':
+            elif user_input == 'm':
                 manual_url = input("Enter the correct live URL: ").strip()
                 if not manual_url:
                     print("No URL entered. Please try again or choose another option.")
                     continue # Ask for input again
                 # Validate if the manually entered URL exists in the live URLs list
                 if manual_url in live_url_set:
-                    print(f"Selected (manual): {manual_url}")
+                    print(f"Selected (m): {manual_url}")
                     verified_pairs.append((url_404, manual_url))
                     break # Move to the next 404 URL
                 else:
@@ -189,12 +189,12 @@ def start_active_learning_session(matches: list[dict], df_404: pd.DataFrame, df_
                         verified_pairs.append((url_404, selected_live_url))
                         break # Move to the next 404 URL
                     else:
-                        print(f"Invalid number. Please enter a number between 1 and {len(options)}, 'manual', 'skip', or 'quit'.")
+                        print(f"Invalid number. Please enter a number between 1 and {len(options)}, 'm', 'skip', or 'quit'.")
                 except ValueError:
                     # This case should ideally not be reached if isdigit() is true, but handle defensively
-                    print("Invalid input. Please enter a number, 'manual', 'skip', or 'quit'.")
+                    print("Invalid input. Please enter a number, 'm', 'skip', or 'quit'.")
             else:
-                print("Invalid input. Please enter a number, 'manual', 'skip', or 'quit'.")
+                print("Invalid input. Please enter a number, 'm', 'skip', or 'quit'.")
 
     print("\n--- Active Learning Session Finished ---")
     # Return all pairs verified by the user during the session
